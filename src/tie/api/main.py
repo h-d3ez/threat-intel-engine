@@ -46,20 +46,24 @@ def verify_api_key(x_api_key: str | None = Header(default=None)) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+    effective_redis_url = (os.getenv("REDIS_URL") or settings.redis_url).strip()
+    effective_db_url = (os.getenv("DATABASE_URL") or settings.database_url).strip()
+
+    redis_client = redis.from_url(effective_redis_url, decode_responses=True)
     app.state.redis = redis_client
 
     try:
-        db_pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=5)
-    except Exception:
+        db_pool = await asyncpg.create_pool(effective_db_url, min_size=1, max_size=5)
+    except Exception as exc:
+        print(f"DB pool error: {exc}", flush=True)
         db_pool = None
     app.state.db = db_pool
 
     if db_pool is not None:
         intel_service = ThreatIntelService(
             redis_client=redis_client,
-            mode=settings.intel_mode,
-            abuseipdb_api_key=settings.abuseipdb_api_key,
+            mode=os.getenv("INTEL_MODE") or settings.intel_mode,
+            abuseipdb_api_key=os.getenv("ABUSEIPDB_API_KEY") or settings.abuseipdb_api_key,
             cache_ttl_seconds=settings.intel_cache_ttl_seconds,
         )
         rule_engine = DetectionEngine(
