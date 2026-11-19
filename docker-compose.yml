@@ -1,0 +1,81 @@
+name: threat-intel-engine
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis:    { condition: service_healthy }
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks: [data]            # not reachable from host or internet
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # noeviction: if memory fills, writes FAIL loudly (visible backpressure)
+    # instead of silently evicting sliding-window or dedup keys.
+    command: >
+      redis-server --requirepass ${REDIS_PASSWORD}
+      --appendonly yes --appendfsync everysec
+      --maxmemory 256mb --maxmemory-policy noeviction
+    volumes: [redisdata:/data]
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} --no-auth-warning ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:                           # ingestion API + HTMX SOC dashboard
+    <<: *app
+    command: uvicorn tie.api.main:app --host 0.0.0.0 --port 8000
+    ports: ["127.0.0.1:8000:8000"]   # loopback only; put a reverse proxy/TLS in front for real use
+    networks: [edge, data]
+
+  worker:                        # stream consumer: persist -> detect -> enrich -> alert
+    <<: *app
+    command: python -m tie.worker
+    networks: [data, egress]     # egress needed for threat-intel APIs + webhook
+
+  simulator:                     # opt-in: docker compose --profile demo run --rm simulator
+    <<: *app
+    profiles: ["demo"]
+    command: python simulator/simulate_attacks.py --target http://api:8000 --speed 10
+    networks: [edge]
+    depends_on: [api]
+
+networks:
+  edge:   {}                     # api <-> host
+  egress: {}                     # worker <-> internet (threat intel, webhook)
+  data:
+    internal: true               # no route to the internet at all
+
+volumes:
+  pgdata:
+  redisdata:
